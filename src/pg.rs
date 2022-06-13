@@ -1,22 +1,23 @@
-use diesel::connection::{AnsiTransactionManager, Connection, SimpleConnection};
-use diesel::deserialize::{Queryable, QueryableByName};
+use diesel::connection::{AnsiTransactionManager, Connection, LoadRowIter, SimpleConnection};
+use diesel::deserialize::Queryable;
+use diesel::expression::QueryMetadata;
 use diesel::pg::{Pg, PgConnection, TransactionBuilder};
-use diesel::query_builder::{AsQuery, QueryFragment, QueryId};
+use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::result::{ConnectionError, ConnectionResult, QueryResult};
+use diesel::select;
 use diesel::sql_types::HasSqlType;
 use diesel::RunQueryDsl;
-use diesel::{no_arg_sql_function, select};
 use tracing::{debug, field, instrument};
 
 // https://www.postgresql.org/docs/12/functions-info.html
 // db.name
-no_arg_sql_function!(current_database, diesel::sql_types::Text);
+sql_function!(fn current_database() -> diesel::sql_types::Text);
 // net.peer.ip
-no_arg_sql_function!(inet_server_addr, diesel::sql_types::Inet);
+sql_function!(fn inet_server_addr() -> diesel::sql_types::Inet);
 // net.peer.port
-no_arg_sql_function!(inet_server_port, diesel::sql_types::Integer);
+sql_function!(fn inet_server_port() -> diesel::sql_types::Integer);
 // db.version
-no_arg_sql_function!(version, diesel::sql_types::Text);
+sql_function!(fn version() -> diesel::sql_types::Text);
 
 #[derive(Queryable, Clone, Debug, PartialEq)]
 struct PgConnectionInfo {
@@ -70,7 +71,7 @@ impl Connection for InstrumentedPgConnection {
     )]
     fn establish(database_url: &str) -> ConnectionResult<InstrumentedPgConnection> {
         debug!("establishing postgresql connection");
-        let conn = PgConnection::establish(database_url)?;
+        let mut conn = PgConnection::establish(database_url)?;
 
         debug!("querying postgresql connection information");
         let info: PgConnectionInfo = select((
@@ -79,7 +80,7 @@ impl Connection for InstrumentedPgConnection {
             inet_server_port,
             version,
         ))
-        .get_result(&conn)
+        .get_result(&mut conn)
         .map_err(ConnectionError::CouldntSetupConfiguration)?;
 
         let span = tracing::Span::current();
@@ -104,12 +105,15 @@ impl Connection for InstrumentedPgConnection {
             net.peer.ip=%self.info.inet_server_addr,
             net.peer.port=%self.info.inet_server_port,
         ),
-        skip(self, query),
+        skip(self, f),
         err,
     )]
-    fn execute(&self, query: &str) -> QueryResult<usize> {
-        debug!("executing query");
-        self.inner.execute(query)
+    fn transaction<T, E, F>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<diesel::result::Error>,
+    {
+        self.inner.transaction(f)
     }
 
     #[doc(hidden)]
@@ -125,37 +129,15 @@ impl Connection for InstrumentedPgConnection {
         skip(self, source),
         err,
     )]
-    fn query_by_index<T, U>(&self, source: T) -> QueryResult<Vec<U>>
+    fn load<'conn, 'query, T>(
+        &'conn mut self,
+        source: T,
+    ) -> QueryResult<LoadRowIter<'conn, 'query, Self, Self::Backend>>
     where
-        T: AsQuery,
-        T::Query: QueryFragment<Pg> + QueryId,
-        Pg: HasSqlType<T::SqlType>,
-        U: Queryable<T::SqlType, Pg>,
+        T: Query + QueryFragment<Self::Backend> + QueryId + 'query,
+        Self::Backend: QueryMetadata<T::SqlType>,
     {
-        debug!("querying by index");
-        self.inner.query_by_index(source)
-    }
-
-    #[doc(hidden)]
-    #[instrument(
-        fields(
-            db.name=%self.info.current_database,
-            db.system="postgresql",
-            db.version=%self.info.version,
-            otel.kind="client",
-            net.peer.ip=%self.info.inet_server_addr,
-            net.peer.port=%self.info.inet_server_port,
-        ),
-        skip(self, source),
-        err,
-    )]
-    fn query_by_name<T, U>(&self, source: &T) -> QueryResult<Vec<U>>
-    where
-        T: QueryFragment<Pg> + QueryId,
-        U: QueryableByName<Pg>,
-    {
-        debug!("querying by name");
-        self.inner.query_by_name(source)
+        self.inner.load(source);
     }
 
     #[doc(hidden)]
@@ -175,7 +157,6 @@ impl Connection for InstrumentedPgConnection {
     where
         T: QueryFragment<Pg> + QueryId,
     {
-        debug!("executing returning count");
         self.inner.execute_returning_count(source)
     }
 
@@ -191,9 +172,8 @@ impl Connection for InstrumentedPgConnection {
         ),
         skip(self),
     )]
-    fn transaction_manager(&self) -> &Self::TransactionManager {
-        debug!("retrieving transaction manager");
-        &self.inner.transaction_manager()
+    fn transaction_state(&self) -> &Self::TransactionManager {
+        &self.inner.transaction_state()
     }
 }
 

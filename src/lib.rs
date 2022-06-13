@@ -77,9 +77,9 @@ passwords
 #[macro_use]
 extern crate diesel;
 
-#[cfg(feature = "mysql")]
+//#[cfg(feature = "mysql")]
 pub mod mysql;
-#[cfg(feature = "postgres")]
+//#[cfg(feature = "postgres")]
 pub mod pg;
-#[cfg(feature = "sqlite")]
+//#[cfg(feature = "sqlite")]
 pub mod sqlite;

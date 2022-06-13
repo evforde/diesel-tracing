@@ -1,7 +1,7 @@
-use diesel::connection::{AnsiTransactionManager, Connection, SimpleConnection};
-use diesel::deserialize::{Queryable, QueryableByName};
+use diesel::connection::{AnsiTransactionManager, Connection, LoadRowIter, SimpleConnection};
+use diesel::expression::QueryMetadata;
 use diesel::mysql::{Mysql, MysqlConnection};
-use diesel::query_builder::{AsQuery, QueryFragment, QueryId};
+use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::result::{ConnectionResult, QueryResult};
 use diesel::sql_types::HasSqlType;
 use tracing::instrument;
@@ -31,31 +31,26 @@ impl Connection for InstrumentedMysqlConnection {
     }
 
     #[doc(hidden)]
-    #[instrument(fields(db.system="mysql", otel.kind="client"), skip(self, query), err)]
-    fn execute(&self, query: &str) -> QueryResult<usize> {
-        self.inner.execute(query)
+    #[instrument(fields(db.system="mysql", otel.kind="client"), skip(self, f), err)]
+    fn transaction<T, E, F>(&mut self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<diesel::result::Error>,
+    {
+        self.inner.transaction(f)
     }
 
     #[doc(hidden)]
     #[instrument(fields(db.system="mysql", otel.kind="client"), skip(self, source), err)]
-    fn query_by_index<T, U>(&self, source: T) -> QueryResult<Vec<U>>
+    fn load<'conn, 'query, T>(
+        &'conn mut self,
+        source: T,
+    ) -> QueryResult<LoadRowIter<'conn, 'query, Self, Self::Backend>>
     where
-        T: AsQuery,
-        T::Query: QueryFragment<Mysql> + QueryId,
-        Mysql: HasSqlType<T::SqlType>,
-        U: Queryable<T::SqlType, Mysql>,
+        T: Query + QueryFragment<Self::Backend> + QueryId + 'query,
+        Self::Backend: QueryMetadata<T::SqlType>,
     {
-        self.inner.query_by_index(source)
-    }
-
-    #[doc(hidden)]
-    #[instrument(fields(db.system="mysql", otel.kind="client"), skip(self, source), err)]
-    fn query_by_name<T, U>(&self, source: &T) -> QueryResult<Vec<U>>
-    where
-        T: QueryFragment<Mysql> + QueryId,
-        U: QueryableByName<Mysql>,
-    {
-        self.inner.query_by_name(source)
+        self.inner.load(source);
     }
 
     #[doc(hidden)]
@@ -69,7 +64,7 @@ impl Connection for InstrumentedMysqlConnection {
 
     #[doc(hidden)]
     #[instrument(fields(db.system="mysql", otel.kind="client"), skip(self))]
-    fn transaction_manager(&self) -> &Self::TransactionManager {
-        &self.inner.transaction_manager()
+    fn transaction_state(&self) -> &Self::TransactionManager {
+        &self.inner.transaction_state()
     }
 }
