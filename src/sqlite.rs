@@ -1,7 +1,9 @@
-use diesel::connection::{AnsiTransactionManager, Connection, SimpleConnection};
-use diesel::deserialize::{Queryable, QueryableByName};
-use diesel::query_builder::{AsQuery, QueryFragment, QueryId};
-use diesel::result::Error;
+use diesel::connection::{
+    AnsiTransactionManager, Connection, ConnectionGatWorkaround, SimpleConnection,
+    TransactionManager,
+};
+use diesel::deserialize::{FromSqlRow, StaticallySizedRow};
+use diesel::query_builder::{QueryFragment, QueryId};
 use diesel::result::{ConnectionResult, QueryResult};
 use diesel::serialize::ToSql;
 use diesel::sql_types::HasSqlType;
@@ -14,11 +16,18 @@ pub struct InstrumentedSqliteConnection {
 
 impl SimpleConnection for InstrumentedSqliteConnection {
     #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, query), err)]
-    fn batch_execute(&self, query: &str) -> QueryResult<()> {
+    fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
         self.inner.batch_execute(query)?;
 
         Ok(())
     }
+}
+
+impl<'conn, 'query> ConnectionGatWorkaround<'conn, 'query, Sqlite>
+    for InstrumentedSqliteConnection
+{
+    type Cursor = <SqliteConnection as ConnectionGatWorkaround<'conn, 'query, Sqlite>>::Cursor;
+    type Row = <SqliteConnection as ConnectionGatWorkaround<'conn, 'query, Sqlite>>::Row;
 }
 
 impl Connection for InstrumentedSqliteConnection {
@@ -32,80 +41,63 @@ impl Connection for InstrumentedSqliteConnection {
         })
     }
 
-    #[doc(hidden)]
-    #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, query), err)]
-    fn execute(&self, query: &str) -> QueryResult<usize> {
-        self.inner.execute(query)
-    }
-
-    #[doc(hidden)]
-    #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, source), err)]
-    fn query_by_index<T, U>(&self, source: T) -> QueryResult<Vec<U>>
+    #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, f))]
+    fn transaction<T, E, F>(&mut self, f: F) -> Result<T, E>
     where
-        T: AsQuery,
-        T::Query: QueryFragment<Sqlite> + QueryId,
-        Sqlite: HasSqlType<T::SqlType>,
-        U: Queryable<T::SqlType, Sqlite>,
+        F: FnOnce(&mut Self) -> Result<T, E>,
+        E: From<diesel::result::Error>,
     {
-        self.inner.query_by_index(source)
+        Self::TransactionManager::transaction(self, f)
     }
 
-    #[doc(hidden)]
     #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, source), err)]
-    fn query_by_name<T, U>(&self, source: &T) -> QueryResult<Vec<U>>
-    where
-        T: QueryFragment<Sqlite> + QueryId,
-        U: QueryableByName<Sqlite>,
-    {
-        self.inner.query_by_name(source)
-    }
-
-    #[doc(hidden)]
-    #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, source), err)]
-    fn execute_returning_count<T>(&self, source: &T) -> QueryResult<usize>
+    fn execute_returning_count<T>(&mut self, source: &T) -> QueryResult<usize>
     where
         T: QueryFragment<Sqlite> + QueryId,
     {
         self.inner.execute_returning_count(source)
     }
 
-    #[doc(hidden)]
     #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self))]
-    fn transaction_manager(&self) -> &Self::TransactionManager {
-        &self.inner.transaction_manager()
+    fn transaction_state(&mut self) -> &mut Self::TransactionManager {
+        self.inner.transaction_state()
     }
 }
 
 impl InstrumentedSqliteConnection {
+    /*
     #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, f))]
     pub fn immediate_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce() -> Result<T, E>,
+        F: FnOnce(&mut Self) -> Result<T, E>,
         E: From<Error>,
     {
+        let f = |conn: &mut SqliteConnection| f(&mut self);
         self.inner.immediate_transaction(f)
     }
 
     #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, f))]
     pub fn exclusive_transaction<T, E, F>(&self, f: F) -> Result<T, E>
     where
-        F: FnOnce() -> Result<T, E>,
+        F: FnOnce(&mut Self) -> Result<T, E>,
         E: From<Error>,
     {
+        let f = |conn: &mut SqliteConnection| f(&mut self);
         self.inner.exclusive_transaction(f)
     }
+    */
 
     #[doc(hidden)]
     #[instrument(fields(db.system="sqlite", otel.kind="client"), skip(self, f))]
     pub fn register_sql_function<ArgsSqlType, RetSqlType, Args, Ret, F>(
-        &self,
+        &mut self,
         fn_name: &str,
         deterministic: bool,
         f: F,
     ) -> QueryResult<()>
     where
-        F: FnMut(Args) -> Ret + Send + 'static,
-        Args: Queryable<ArgsSqlType, Sqlite>,
+        F: FnMut(Args) -> Ret + std::panic::UnwindSafe + Send + 'static,
+        Args: FromSqlRow<ArgsSqlType, Sqlite> + StaticallySizedRow<ArgsSqlType, Sqlite>,
         Ret: ToSql<RetSqlType, Sqlite>,
         Sqlite: HasSqlType<RetSqlType>,
     {
